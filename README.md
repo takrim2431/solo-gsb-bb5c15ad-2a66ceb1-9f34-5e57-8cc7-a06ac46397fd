@@ -62,8 +62,8 @@ docker run -d -p 8000:8000 -v "$(pwd)/data:/data" -e DATA_DIR=/data page-turn-pl
 
 - 交互式文档（Swagger UI）：`http://localhost:8000/docs`
 - 健康检查：`GET http://localhost:8000/health`
-- 提交规划：`POST http://localhost:8000/api/v1/plans`
-- 按 ID 查询：`GET http://localhost:8000/api/v1/plans/{id}`
+- 提交规划：`POST http://localhost:8000/api/v1/plans`（支持可选 `Idempotency-Key` 请求头做幂等重试，见第 1 节）
+- 按 ID 查询：`GET http://localhost:8000/api/v1/plans/{id}`（可查询幂等复用得到的方案）
 - 排练录音时间戳定位：`POST http://localhost:8000/api/v1/plans/{id}/rehearsal/locate`
 - 排练翻页提示：`POST http://localhost:8000/api/v1/plans/{id}/rehearsal/cues`
 - 排练翻页空档：`POST http://localhost:8000/api/v1/plans/{id}/rehearsal/turn-slots`
@@ -175,6 +175,40 @@ curl -X POST http://localhost:8000/api/v1/plans \
 - `pages[].start_measure` / `end_measure`：本页小节范围（0 基，结束为闭区间）；
 - `pages[].turn_silence`：本页之后翻页点的静默秒数；最后一页无翻页点，为 `null`；
 - `shortest_turn_silence`：所有翻页点中最短的静默秒数；整篇只有一页（无翻页点）时为 `null`。
+
+#### 幂等重试（可选请求头 `Idempotency-Key`）
+
+客户端因网络超时等原因需要**重试**提交时，可在请求头携带自定义的 `Idempotency-Key`（任意非空字符串，最长 255 字符；两端空白会被去除，空串或纯空白等同于未携带）：
+
+- **首次创建**：该键第一次出现时正常计算并保存方案，返回 `201`；方案与键绑定在**同一个 SQLite 事务**中原子写入（`BEGIN IMMEDIATE`），因此并发的相同键请求只会建立**一份**方案——抢到写锁的请求创建，其余请求在锁上等待后复用同一份结果。
+- **同键同内容重试**：以**校验后的完整请求**生成稳定内容标识（SHA-256；**对象字段书写顺序无关**，如先写 `page_height` 还是 `min_turn_time` 视为同一请求；**数组顺序保留**，如 `required_breaks: [2,5]` 与 `[5,2]` 视为不同内容）。内容标识一致时直接返回首次创建的方案：**相同的 `id`、相同的 `created_at`、相同的 `result`**，HTTP `200`，**不新增任何记录**。
+- **同键不同内容**：同一 `Idempotency-Key` 提交内容标识不同的请求，返回 `409 Conflict`（错误信息中给出首次方案 ID），不新增记录、不覆盖原绑定；请为新请求更换新键。
+- **规划失败不占键**：请求体通过校验但规划本身无解（如单小节超高，返回 `422`）时不写入方案也不写入键绑定；同一个键随后可用于另一份合法请求。
+- **未携带键**：省略请求头（或传空串/纯空白）时行为与原来完全一致，每次提交都新建方案。
+
+```bash
+# 首次创建（201）
+curl -X POST http://localhost:8000/api/v1/plans \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: 7e2f9c4a-8b31-4d02-9f65-2c1e8a7b3d04' \
+  -d '{
+    "measure_heights": [3, 3, 4, 2],
+    "silence_seconds": [2, 5, 1, 0],
+    "page_height": 6,
+    "min_turn_time": 2
+  }'
+
+# 网络重试：原样重发同一个请求并带上同一个键 -> 200，
+# 返回的 id / created_at / result 与首次完全一致，不新增记录
+curl -X POST http://localhost:8000/api/v1/plans \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: 7e2f9c4a-8b31-4d02-9f65-2c1e8a7b3d04' \
+  -d '{ "min_turn_time": 2, "page_height": 6,
+        "silence_seconds": [2, 5, 1, 0],
+        "measure_heights": [3, 3, 4, 2] }'
+```
+
+随后仍可用 `GET /api/v1/plans/{id}` 按 ID 查询该（首次或复用得到的）方案。幂等键绑定随 `./data/plans.db` 持久化，容器重启后重试语义依然有效。
 
 ### 2. 按 ID 查询结果
 
@@ -1002,6 +1036,9 @@ curl -X POST http://localhost:8000/api/v1/tour/stand-changes \
 
 | 状态码 | 触发条件 |
 | --- | --- |
+| `200` | 携带 `Idempotency-Key` 的重试请求命中同键同内容的已存方案（复用首次结果，不新增记录） |
+| `409` | `Idempotency-Key` 已绑定另一份**不同内容**的请求：`幂等键 '…' 已用于另一份不同内容的请求（已存方案 …）：同一 Idempotency-Key 只能重试完全相同的请求，内容不同请更换新键。` |
+| `400` | `Idempotency-Key` 去除两端空白后长度超过 255 字符：`Idempotency-Key 长度（… 字符）超过上限 255 字符` |
 | `422` | 参数校验失败（空数组、长度不一致、负数/零高度、多余字段等） |
 | `422` | 必翻/禁翻序号非法：含 `0`、末尾序号或越界值、元素非严格整数、数组内重复或两数组交叉，如 `required_breaks 含越界序号 0：合法范围为 1..n-1…` |
 | `422` | 必翻点静默不足：`必翻位置 b（第 b 小节之后）静默仅 … 秒，低于最低翻页时间 … 秒，必翻点静默不足，无合法方案。` |

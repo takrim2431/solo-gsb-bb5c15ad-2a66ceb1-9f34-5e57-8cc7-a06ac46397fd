@@ -6,7 +6,7 @@ import os
 from contextlib import asynccontextmanager
 from typing import List, Optional, Tuple
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Response
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .booklet import ImpositionError, impose_booklet
@@ -22,7 +22,12 @@ from .rehearsal import (
     TurnSlot,
     prepare_rehearsal,
 )
-from .storage import PlanStore
+from .storage import (
+    IDEMPOTENCY_KEY_MAX_LENGTH,
+    IdempotencyConflict,
+    PlanStore,
+    content_fingerprint,
+)
 from .tour_packing import TourPackingError, pack_tour_books
 from .tour_stands import StandAction, StandChangeError, plan_stand_changes
 
@@ -161,6 +166,16 @@ def _plan_to_result(plan: Plan) -> PlanResult:
         shortest_turn_silence=plan.shortest_turn_silence,
         breaks=plan.breaks,
         pages=[PageOut(**vars(p)) for p in plan.pages],
+    )
+
+
+def _record_to_response(record: dict) -> PlanResponse:
+    """把存储记录（含幂等复用读回的记录）组装为提交/查询共用的响应模型。"""
+    return PlanResponse(
+        id=record["id"],
+        created_at=record["created_at"],
+        request=PlanRequest(**record["request"]),
+        result=PlanResult(**record["result"]),
     )
 
 
@@ -1073,8 +1088,54 @@ class TourStandChangesResponse(BaseModel):
 
 
 @app.post("/api/v1/plans", response_model=PlanResponse, status_code=201)
-def create_plan(payload: PlanRequest) -> PlanResponse:
-    """提交一次翻页规划，返回最优方案并保存到本地。"""
+def create_plan(
+    payload: PlanRequest,
+    response: Response,
+    idempotency_key: Optional[str] = Header(
+        default=None,
+        alias="Idempotency-Key",
+        description=(
+            "可选幂等键：网络重试时以相同键提交相同内容，直接返回首次创建的"
+            "方案（ID、创建时间、结果均一致），不新增记录；同键不同内容返回 409。"
+            "省略或为空则按原方式每次新建。"
+        ),
+    ),
+) -> PlanResponse:
+    """提交一次翻页规划，返回最优方案并保存到本地。
+
+    携带 ``Idempotency-Key`` 请求头时启用幂等：以**校验后的完整请求**生成
+    稳定内容标识（对象字段书写顺序无关，数组顺序保留），在 SQLite 事务内
+    原子保存方案与键绑定；同键同内容重试返回同一份已存方案（不新增记录），
+    同键不同内容返回 409，并发相同键只建立一份方案。规划本身失败（422）
+    时不写入绑定，即失败不占键；未携带键时行为不变，每次新建方案。
+    """
+    # 空串/纯空白头视为未携带；其余去除两端空白后作为键
+    key = idempotency_key.strip() if idempotency_key is not None else None
+    if key and len(key) > IDEMPOTENCY_KEY_MAX_LENGTH:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Idempotency-Key 长度（{len(key)} 字符）超过上限"
+                f" {IDEMPOTENCY_KEY_MAX_LENGTH} 字符"
+            ),
+        )
+
+    request_data = payload.model_dump()
+    assert store is not None
+
+    if key:
+        # 快速路径：键已存在则在规划前判定，使重试不再重复计算：
+        # 内容一致直接复用；内容不一致（同键不同内容）立即 409。
+        existing = store.lookup_idempotency_key(key)
+        if existing is not None:
+            if existing["content_hash"] != content_fingerprint(request_data):
+                raise HTTPException(
+                    status_code=409,
+                    detail=str(IdempotencyConflict(key, existing["id"])),
+                )
+            response.status_code = 200
+            return _record_to_response(existing)
+
     try:
         plan = plan_pages(
             heights=payload.measure_heights,
@@ -1085,35 +1146,40 @@ def create_plan(payload: PlanRequest) -> PlanResponse:
             forbidden_breaks=payload.forbidden_breaks,
         )
     except PlanningError as exc:
-        # 单小节超高 / 必翻点静默不足 / 无合法方案：语义错误，明确报错
+        # 单小节超高 / 必翻点静默不足 / 无合法方案：语义错误，明确报错。
+        # 此时尚未写入任何键绑定——规划失败不占键，同键可随后重试。
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     result = _plan_to_result(plan)
-    assert store is not None
-    plan_id = store.save(payload.model_dump(), result.model_dump())
-    record = store.get(plan_id)
-    assert record is not None
-    return PlanResponse(
-        id=record["id"],
-        created_at=record["created_at"],
-        request=payload,
-        result=result,
-    )
+
+    if not key:
+        plan_id = store.save(request_data, result.model_dump())
+        record = store.get(plan_id)
+        assert record is not None
+        return _record_to_response(record)
+
+    try:
+        # 事务内 BEGIN IMMEDIATE：并发相同键时后来者在写锁上等待，
+        # 首个请求提交后重查命中，复用同一方案；不同内容回滚并 409。
+        record, reused = store.save_idempotent(
+            key, request_data, result.model_dump()
+        )
+    except IdempotencyConflict as exc:
+        # 与快速路径竞争窗口内被并发请求抢先写入的情形共用同一出口
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if reused:
+        response.status_code = 200
+    return _record_to_response(record)
 
 
 @app.get("/api/v1/plans/{plan_id}", response_model=PlanResponse)
 def get_plan(plan_id: str) -> PlanResponse:
-    """按 ID 查询已保存的规划结果。"""
+    """按 ID 查询已保存的规划结果（含经幂等重试复用的方案）。"""
     assert store is not None
     record = store.get(plan_id)
     if record is None:
         raise HTTPException(status_code=404, detail=f"规划结果不存在：{plan_id}")
-    return PlanResponse(
-        id=record["id"],
-        created_at=record["created_at"],
-        request=PlanRequest(**record["request"]),
-        result=PlanResult(**record["result"]),
-    )
+    return _record_to_response(record)
 
 
 @app.post(
