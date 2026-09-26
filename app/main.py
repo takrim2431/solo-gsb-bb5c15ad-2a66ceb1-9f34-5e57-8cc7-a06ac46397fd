@@ -1,12 +1,14 @@
-"""FastAPI 入口：提交翻页规划、按 ID 查询结果、排练录音时间戳定位、翻页提示与翻页空档。"""
+"""FastAPI 入口：提交翻页规划（支持 Idempotency-Key 幂等创建）、按 ID 查询结果、排练录音时间戳定位、翻页提示与翻页空档。"""
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 from contextlib import asynccontextmanager
 from typing import List, Optional, Tuple
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .booklet import ImpositionError, impose_booklet
@@ -22,7 +24,7 @@ from .rehearsal import (
     TurnSlot,
     prepare_rehearsal,
 )
-from .storage import PlanStore
+from .storage import IdempotencyConflictError, PlanStore
 from .tour_packing import TourPackingError, pack_tour_books
 from .tour_stands import StandAction, StandChangeError, plan_stand_changes
 
@@ -162,6 +164,22 @@ def _plan_to_result(plan: Plan) -> PlanResult:
         breaks=plan.breaks,
         pages=[PageOut(**vars(p)) for p in plan.pages],
     )
+
+
+def _content_hash(payload: PlanRequest) -> str:
+    """由校验后的完整请求生成稳定内容标识。
+
+    以 pydantic 校验后的完整模型（含默认值）做规范化 JSON 序列化：
+    对象字段按键名排序（字段顺序无关）、数组保持原顺序（顺序敏感），
+    再取 SHA-256 作为内容标识。
+    """
+    canonical = json.dumps(
+        payload.model_dump(),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 # ---------------------------------------- 排练录音时间戳定位
@@ -1073,8 +1091,52 @@ class TourStandChangesResponse(BaseModel):
 
 
 @app.post("/api/v1/plans", response_model=PlanResponse, status_code=201)
-def create_plan(payload: PlanRequest) -> PlanResponse:
-    """提交一次翻页规划，返回最优方案并保存到本地。"""
+def create_plan(
+    payload: PlanRequest,
+    idempotency_key: Optional[str] = Header(
+        default=None,
+        alias="Idempotency-Key",
+        description="可选幂等键：网络重试时同键同内容返回首次保存的方案，不重复创建",
+    ),
+) -> PlanResponse:
+    """提交一次翻页规划，返回最优方案并保存到本地。
+
+    携带 ``Idempotency-Key`` 请求头时按幂等创建处理：同一键首次成功创建后，
+    以相同键重试**相同内容**的请求直接返回已存方案（同一 ID、创建时间与结果，
+    不新增记录）；相同键提交**不同内容**返回 ``409``；规划或校验失败不占键，
+    修正内容后可用同一键重新提交。未携带该头时每次请求都创建新方案。
+    """
+    assert store is not None
+
+    request_hash: Optional[str] = None
+    if idempotency_key is not None:
+        if not idempotency_key.strip():
+            raise HTTPException(
+                status_code=400, detail="Idempotency-Key 不能为空字符串"
+            )
+        if len(idempotency_key) > 255:
+            raise HTTPException(
+                status_code=400, detail="Idempotency-Key 长度不能超过 255 个字符"
+            )
+        request_hash = _content_hash(payload)
+        binding = store.get_idempotency_binding(idempotency_key)
+        if binding is not None:
+            if binding["request_hash"] != request_hash:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Idempotency-Key 冲突：键 {idempotency_key!r} "
+                    "已绑定不同的请求内容，请更换幂等键或去掉该请求头后重新创建",
+                )
+            # 同键同内容：直接返回已存方案，不重新规划、不新增记录
+            record = store.get(binding["plan_id"])
+            assert record is not None
+            return PlanResponse(
+                id=record["id"],
+                created_at=record["created_at"],
+                request=PlanRequest(**record["request"]),
+                result=PlanResult(**record["result"]),
+            )
+
     try:
         plan = plan_pages(
             heights=payload.measure_heights,
@@ -1085,12 +1147,24 @@ def create_plan(payload: PlanRequest) -> PlanResponse:
             forbidden_breaks=payload.forbidden_breaks,
         )
     except PlanningError as exc:
-        # 单小节超高 / 必翻点静默不足 / 无合法方案：语义错误，明确报错
+        # 单小节超高 / 必翻点静默不足 / 无合法方案：语义错误，明确报错；
+        # 规划失败不写库，幂等键也不会被占用
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     result = _plan_to_result(plan)
-    assert store is not None
-    plan_id = store.save(payload.model_dump(), result.model_dump())
+    if request_hash is None:
+        plan_id = store.save(payload.model_dump(), result.model_dump())
+    else:
+        try:
+            # 方案与键绑定在同一事务内原子写入；并发相同键只会建立一份方案
+            plan_id, _created = store.save_idempotent(
+                idempotency_key,
+                request_hash,
+                payload.model_dump(),
+                result.model_dump(),
+            )
+        except IdempotencyConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
     record = store.get(plan_id)
     assert record is not None
     return PlanResponse(
